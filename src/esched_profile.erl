@@ -27,8 +27,7 @@ start_link() ->
 
 init([]) ->
 	erlang:send_after(1000, self(), {output_stats, erlang:system_time(microsecond)}),
-	erlang:trace(all, true, [running, running_procs, running_ports, scheduler_id, timestamp, {tracer, self()}]),
-	erlang:system_monitor(self(), [{long_gc, 0}]),
+	erlang:trace(all, true, [exiting, running, running_procs, running_ports, scheduler_id, timestamp, {tracer, self()}]),
 	ets:new(x, [named_table, ordered_set]),
 	ets:new(y, [public, named_table, ordered_set]),
 	InitState = #state{},
@@ -53,29 +52,17 @@ handle_info({trace_ts, _, _, _, 0, _} = Msg, State) ->
 	%ok = file:write(State#state.out, io_lib:format("~100000000p~n", [Msg])),
 	ets:insert(x, {ets:info(x, size), Msg}),
 	{noreply, State};
-handle_info({trace_ts, Pid, in, MFA, SchedulerId, Ts} = Msg, State) ->
+handle_info({trace_ts, Pid, In, MFA, SchedulerId, Ts} = Msg, State) when In =:= in; In =:= in_exiting ->
 	case State#state.out of
 		Pid -> ok;
 		_ -> ets:insert(x, {ets:info(x, size), Msg})
 			 %ok% = file:write(State#state.out, io_lib:format("~100000000p~n", [Msg]))
 	end,
 	OldSchedState = erlang:element(SchedulerId, State#state.current),
-	case OldSchedState of
-		undefined ->
-			SaneState = State;
-		{OldPid, _OldMFA, _InTs} = Other ->
-			timer:sleep(10),
-			ets:insert(y, {ets:info(y, size), {"Transition in -> in: ~10000000p (was: ~1000000000p) ~10000000p~nI am: ~p~n", [Msg, Other, erlang:process_info(OldPid, status), {erlang:system_info(scheduler_id), ets_lastn(x, 10) ++ ['HERE'] ++ lists:sublist(element(2, erlang:process_info(self(), messages)), 10)}]}}),
-			%receive
-			%	{trace_ts, OldPid, out, _OutMFA, SchedulerId, _OutTs} = OutMsg -> {noreply, SaneState} = handle_info(OutMsg, State)
-			%after 100 -> flush_to_file(State#state.out), exit({mismatched_in, Msg, Other}), SaneState = undefined
-			%end
-			{noreply, SaneState} = handle_info({trace_ts, OldPid, out, meh, SchedulerId, Ts}, State)
-	end,
-	NewCurrent = erlang:setelement(SchedulerId, SaneState#state.current, {Pid, MFA, Ts}),
-	NewSwitches = erlang:setelement(SchedulerId, SaneState#state.sched_switches, erlang:element(SchedulerId, SaneState#state.sched_switches) + 1),
-	{noreply, SaneState#state{current=NewCurrent, sched_switches=NewSwitches}};
-handle_info(Msg={trace_ts, Pid, out, MFA, SchedulerId, OutTs}, State) ->
+	NewCurrent = erlang:setelement(SchedulerId, State#state.current, [{Pid, MFA, Ts}|OldSchedState]),
+	NewSwitches = erlang:setelement(SchedulerId, State#state.sched_switches, erlang:element(SchedulerId, State#state.sched_switches) + 1),
+	{noreply, State#state{current=NewCurrent, sched_switches=NewSwitches}};
+handle_info(Msg={trace_ts, Pid, Out, MFA, SchedulerId, OutTs}, State) when Out =:= out; Out =:= out_exiting; Out =:= out_exited ->
 	case State#state.out of
 		Pid -> ok;
 		_ -> ets:insert(x, {ets:info(x, size), Msg})
@@ -83,22 +70,33 @@ handle_info(Msg={trace_ts, Pid, out, MFA, SchedulerId, OutTs}, State) ->
 	end,
 	OldSchedState = erlang:element(SchedulerId, State#state.current),
 	case OldSchedState of
-		{Pid, _OldMFA, InTs} ->
+		[{Pid, _OldMFA, InTs}|NewSchedState] ->
 			OldTotal = maps:get(Pid, State#state.stats, 0),
 			OldSchedTotal = erlang:element(SchedulerId, State#state.sched_stats),
 			Used = timer:now_diff(OutTs, InTs),
 			NewStats = maps:put(Pid, Used + OldTotal, State#state.stats),
 			NewSchedStats = erlang:setelement(SchedulerId, State#state.sched_stats, Used + OldSchedTotal);
-		undefined ->
+		[] ->
 			io:format("Transition out of nowhere: ~100000000p~n", [Msg]),
 			NewStats = State#state.stats,
+			NewSchedState = [],
 			NewSchedStats = State#state.sched_stats;
 		Other ->
-			io:format("Transition out of somewhere daft: ~100000000p (was: ~100000000p)~n", [Msg, Other]),
-			NewStats = State#state.stats,
-			NewSchedStats = State#state.sched_stats
+			case lists:keytake(Pid, 1, Other) of
+				{value, {Pid, _OldMFA, InTs}, NewSchedState} ->
+					OldTotal = maps:get(Pid, State#state.stats, 0),
+					OldSchedTotal = erlang:element(SchedulerId, State#state.sched_stats),
+					Used = timer:now_diff(OutTs, InTs),
+					NewStats = maps:put(Pid, Used + OldTotal, State#state.stats),
+					NewSchedStats = erlang:setelement(SchedulerId, State#state.sched_stats, Used + OldSchedTotal);
+				_ ->
+					io:format("Transition out of somewhere daft: ~100000000p (was: ~100000000p)~n", [Msg, Other]),
+					NewStats = State#state.stats,
+					NewSchedState = [],
+					NewSchedStats = State#state.sched_stats
+			end
 	end,
-	NewCurrent = erlang:setelement(SchedulerId, State#state.current, undefined),
+	NewCurrent = erlang:setelement(SchedulerId, State#state.current, NewSchedState),
 	{noreply, State#state{current=NewCurrent, stats=NewStats, sched_stats=NewSchedStats}};
 handle_info({output_stats, FromTs}, State) ->
 	NowTs = erlang:system_time(microsecond),
@@ -109,7 +107,7 @@ handle_info({output_stats, FromTs}, State) ->
 	{noreply, State#state{stats=#{}, sched_stats=empty_sched_stats(), sched_switches=empty_sched_stats()}}.
 
 empty_current() ->
-	list_to_tuple(lists:duplicate(erlang:system_info(schedulers), undefined)).
+	list_to_tuple(lists:duplicate(erlang:system_info(schedulers), [])).
 
 empty_sched_stats() ->
 	list_to_tuple(lists:duplicate(erlang:system_info(schedulers), 0)).
