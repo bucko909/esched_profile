@@ -23,11 +23,11 @@
 		}).
 
 start_link() ->
-	gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+	gen_server:start_link({local, ?SERVER}, ?MODULE, [], [{scheduler, 3}]).
 
 init([]) ->
 	erlang:send_after(1000, self(), {output_stats, erlang:system_time(microsecond)}),
-	erlang:trace(all, true, [exiting, running, running_procs, running_ports, scheduler_id, timestamp, {tracer, self()}]),
+	erlang:trace(all, true, [exiting, running, running_procs, running_ports, scheduler_id, timestamp, cpu_timestamp, {tracer, self()}]),
 	ets:new(x, [named_table, ordered_set]),
 	ets:new(y, [public, named_table, ordered_set]),
 	InitState = #state{},
@@ -55,7 +55,7 @@ handle_info({trace_ts, _, _, _, 0, _} = Msg, State) ->
 handle_info({trace_ts, Pid, In, MFA, SchedulerId, Ts} = Msg, State) when In =:= in; In =:= in_exiting ->
 	case State#state.out of
 		Pid -> ok;
-		_ -> ets:insert(x, {ets:info(x, size), Msg})
+		_ -> ok%ets:insert(x, {ets:info(x, size), Msg})
 			 %ok% = file:write(State#state.out, io_lib:format("~100000000p~n", [Msg]))
 	end,
 	OldSchedState = erlang:element(SchedulerId, State#state.current),
@@ -65,12 +65,19 @@ handle_info({trace_ts, Pid, In, MFA, SchedulerId, Ts} = Msg, State) when In =:= 
 handle_info(Msg={trace_ts, Pid, Out, MFA, SchedulerId, OutTs}, State) when Out =:= out; Out =:= out_exiting; Out =:= out_exited ->
 	case State#state.out of
 		Pid -> ok;
-		_ -> ets:insert(x, {ets:info(x, size), Msg})
+		_ -> ok%ets:insert(x, {ets:info(x, size), Msg})
 		%_ -> ok% = file:write(State#state.out, io_lib:format("~100000000p~n", [Msg]))
 	end,
 	OldSchedState = erlang:element(SchedulerId, State#state.current),
 	case OldSchedState of
+		[{Pid, _OldMFA, InTs}|NewSchedState=[]] ->
+			OldTotal = maps:get(Pid, State#state.stats, 0),
+			OldSchedTotal = erlang:element(SchedulerId, State#state.sched_stats),
+			Used = timer:now_diff(OutTs, InTs),
+			NewStats = maps:put(Pid, Used + OldTotal, State#state.stats),
+			NewSchedStats = erlang:setelement(SchedulerId, State#state.sched_stats, Used + OldSchedTotal);
 		[{Pid, _OldMFA, InTs}|NewSchedState] ->
+			io:format("Transition out of stack: ~100000000p (was: ~100000000p)~n", [Msg, NewSchedState]),
 			OldTotal = maps:get(Pid, State#state.stats, 0),
 			OldSchedTotal = erlang:element(SchedulerId, State#state.sched_stats),
 			Used = timer:now_diff(OutTs, InTs),
@@ -84,6 +91,7 @@ handle_info(Msg={trace_ts, Pid, Out, MFA, SchedulerId, OutTs}, State) when Out =
 		Other ->
 			case lists:keytake(Pid, 1, Other) of
 				{value, {Pid, _OldMFA, InTs}, NewSchedState} ->
+					io:format("Transition out of order: ~100000000p (was: ~100000000p)~n", [Msg, Other]),
 					OldTotal = maps:get(Pid, State#state.stats, 0),
 					OldSchedTotal = erlang:element(SchedulerId, State#state.sched_stats),
 					Used = timer:now_diff(OutTs, InTs),
@@ -103,7 +111,7 @@ handle_info({output_stats, FromTs}, State) ->
 	erlang:send_after(1000, self(), {output_stats, NowTs}),
 	SchedulerId = erlang:system_info(scheduler_id),
 	{message_queue_len, QueueLen} = erlang:process_info(self(), message_queue_len),
-	io:format("Stats (on ~p; queue len ~p; covering ~p):~n~p~n~p~n~p~n", [QueueLen, SchedulerId, NowTs - FromTs, State#state.stats, State#state.sched_stats, State#state.sched_switches]),
+	io:format("Stats (on ~p; queue len ~p; covering ~p):~n~p~n~p~n~p~n", [SchedulerId, QueueLen, NowTs - FromTs, State#state.stats, State#state.sched_stats, State#state.sched_switches]),
 	{noreply, State#state{stats=#{}, sched_stats=empty_sched_stats(), sched_switches=empty_sched_stats()}}.
 
 empty_current() ->
@@ -116,7 +124,7 @@ burn(0) -> io:format("finished~n");
 burn(N) -> burn(N - 1).
 
 burnn(0, _) -> ok;
-burnn(N, M) -> erlang:spawn(fun () -> burn(M) end), burnn(N - 1, M).
+burnn(N, M) -> erlang:spawn(fun () -> burn(M) end), timer:sleep(100), burnn(N - 1, M).
 
 flush_to_file(F) ->
 	receive {trace_ts, F, _, _, _, _} -> flush_to_file(F); Msg -> file:write(F, io_lib:format("~100000000p~n", [Msg])), flush_to_file(F)
